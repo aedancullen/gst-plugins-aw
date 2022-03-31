@@ -1,0 +1,234 @@
+*** Overview ***
+
+This repository implements a set of optimized GStreamer 1.0-based video
+sink classes for framebuffers and hardware overlays, including the Linux
+console framebuffer. It is implemented in a base class called
+GstFramebufferSink, and a derived base class called GstFbdevFramebufferSink
+for fbdev devices. These two classes are available in the library
+libgstframebuffersink. An actual plugin implementation called 'fbdev2sink'
+is implemented that is derived from GstFbdevFramebuffeerSink, suitable for
+most Linux framebuffer devices that use fbdev. A plugin called drmsink for
+the newer DRM kernel interface is also provided.
+
+Additionally, a plugin called "sunxifbsink" for Allwinner ARM-based devices is
+provided, based on GstFbdevFramebufferSink. At the moment it implements a hardware
+scaling overlay for several YUY formats and BGRx.
+
+Class schematic:
+
+GstVideoSink -> GstFramebufferSink -> GstFbdevFramebufferSink -> GstFbdev2Sink (plugin)
+                                  \                          \
+                                   -> GstDrmSink (plugin)     -> GstSunxifbSink (plugin)
+
+The GstFramebufferSink class is generic enough that other plugins could be
+implemented, possibly including ones using hardware overlay APIs.
+
+This is work-in-progress although the plugins should be quite usable in
+its current form.
+
+The main features are direct rendering into video memory (instead of
+the two-pass memcpy implementation of the regular fbdevsink plugin),
+support for page flipping/vsync with multiple buffers, and several
+configurable properties regulating video output and Linux framebuffer
+configuration.
+
+Using video memory buffers has a disadvantage though: reading back from
+the buffers is slow (video memory is often on a seperate card, in which case
+reading is very slow, and in a unified memory architecture video memory is
+often uncached or not optimally configured for read-back). Some movie playing
+pipelines do want to read back from video memory, so in this case not using
+a buffer pool but simply copying each frame from system memory (by not enabling
+the buffer-pool option) will be faster. However, when videoconvert
+filter is the last processing element before the sink, it is unlikely that the
+video memory buffers will be read back. Software scaling elements such as
+videoscale may read back from their output buffer. Other sources such as
+videotestsrc never read back from the buffers and can be run at full speed
+with the buffer pool enabled. The "benchmark" property can be set to true on
+all derived sinks to test video memory read/write speed.
+
+*** Installation ***
+
+On a Debian-based system, GStreamer 1.0 and a number of associated
+development packages need to be installed. These include:
+
+	libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libglib2.0-dev
+	libdrm-dev libtool autoconf
+
+Run autogen.sh, then make, and sudo make install.
+
+By default the plugins and library are installed into
+/usr/local/lib/gstreamer-1.0 and /usr/local/lib/. You need to set the
+GST_PLUGIN_PATH environment library to /usr/local/lib/gstreamer-1.0 for the
+plugins to be recognized. Also run sudo ldconfig after installing;
+/usr/local/lib must be in the ldconfig search path.
+
+Run gst-inspect-1.0 fbdev2sink to verify everything is installed correctly.
+
+*** Usage (fbdev2sink) ***
+
+Example launch line:
+
+gst-launch-1.0 videotestsrc horizontal-speed=5 ! queue ! fbdev2sink buffer-pool=true \
+full-screen=true fps=30 >output
+
+This pipeline uses direct streaming into video memory (buffer-pool=true), forces
+the window size to the native full-screen resolution (full-screen=true),
+sets the frames per second to 30, and the text output is directed into the
+file output. The queue forces the sink to use a seperate thread. If everything
+is working correctly this should show a tear-free, multi-buffered scrolling image.
+Verify the file "output" to see whether any features were disabled and everything
+is working correctly.
+
+gst-launch-1.0 playbin uri=file:///home/me/videos/video.mp4 \
+video-sink="fbdev2sink buffer-pool=true full-screen=true \
+graphics-mode=true pan-does-vsync=true" >output
+
+This pipeline runs playbin with fbdev2sink configured with the given parameters.
+Because video memory read access is slow, the following might be faster:
+
+gst-launch-1.0 playbin uri=file:///home/me/videos/video.mp4 \
+video-sink="fbdev2sink buffer-pool=false full-screen=true \
+graphics-mode=true pan-does-vsync=true" >output
+
+The property setting graphics-mode=true can be set to force console graphics
+mode (KD_GRAPHICS, reducing interference from the text console and cursor,
+but textmode may not always be restored in case of a crash so it is handy
+to keep a utility around to restore the console to textmode (KD_TEXT). Using
+the Magic-SysRq sequence Alt-SysRq-V may also help. Another reason for loss
+of textmode is that the display start address is not properly restored;
+switching consoles helps in this case.
+
+Run "gst-inspect-1.0 fbdev2sink" for an overview of configurable property
+settings.
+
+Note: Using the fb device requires root priviledges on most systems. Also,
+on systems implementing DRM, there's usually only one screen buffer available,
+so page flipping and video memory buffer pools cannot be enabled. Use drmsink
+in this case.
+
+*** Usage (drmsink) ***
+
+I have only tested drmsink from the console with no X server or other DRM
+clients running. Running from within X isn't advisable (it seems to
+produce no errors but no screen output).
+
+By default drmsink will assume there is enough video memory for three screen
+buffers. The video-memory property can be used to set the amount of video
+memory used.
+
+Example launch line:
+
+gst-launch-1.0 videotestsrc horizontal-speed=10 ! drmsink full-screen=true \
+fps=60
+
+This pipeline uses drmsink's defaults (not writing directly into video memory
+but using page-flipping with three buffers to synchronize screen updates).
+
+gst-launch-1.0 videotestsrc horizontal-speed=5 ! drmsink buffer-pool=true \
+full-screen=true video-memory=64 fps=30 >output
+
+This pipeline writes directly into video memory (buffer-pool=true), which is
+fast since videotestsrc doesn't read back from the output buffers. 64MB of
+video memory is assumed to be available.
+
+gst-launch-1.0 playbin uri=file:///home/me/videos/video.mp4 \
+video-sink="drmsink full-screen=true" >output
+
+This pipeline uses system memory buffers to play a movie but uses drmsink's
+default of using triple buffering to update the screen.
+
+Notes:
+
+As of kernel 3.8.x, the Nouveau NVIDIA drm kernel driver doesn't seem
+to properly implement syncing to vblank when page flipping and instead appears
+to be faking it with a seperate timer set to the approximate refresh rate. This
+results in noticable tearing with the vertical position of the tearing boundary
+moving slowly up or down (representing the mismatch between the faked timer
+and the real vsync frequency). This is easily observable when running the
+first videotestsrc pipeline mentioned above.
+
+DRM does not require root priviledges.
+
+*** Usage (sunixfbsink) ***
+
+Example launch line using the hardware scaler:
+
+gst-launch-1.0 videotestsrc horizontal-speed=5 ! sunxifbsink buffer-pool=true \
+fps=60 pan-does-vsync=true full-screen=true overlay-format=BGRx >output
+
+This should show a very smooth scrolling test pattern. The 320x240 BGRx video
+output of videotestsrc is scaled to the native full-screen resolution.
+
+gst-launch-1.0 videotestsrc horizontal-speed=5 ! sunxifbsink buffer-pool=true \
+fps=60 pan-does-vsync=true full-screen=true overlay-format=Y444 \
+width-before-scaling=640 height-before-scaling=480 >output
+
+In this pipeline, 640x480 video output of videotestsrc in Y444 format is scaled
+to the native full-screen resolution.
+
+gst-launch-1.0 playbin uri=file:///home/me/videos/video.mp4 \
+video-sink="sunxifbsink full-screen=true graphics-mode=true pan-does-vsync=true \
+overlay-format=Y444" >output
+
+This plays a video file using a full-screen hardware overlay in Y444 format
+(which is better quality than the default overlay format).
+
+Supported overlay formats:
+
+YUY2	Packed 4:2:2 YUV
+UYVY	Packed 4:2:2 YUV
+Y444	Planar 4:4:4 YUV
+AYUV	Packed AYUV with alpha channel (A0-Y0-U0-V0 ...)
+BGRx	RGB
+
+The following overlay formats are supported, but only for even source video
+widths:
+
+I420	Planar 4:2:0 YUV (three planes)
+YV12	Planar 4:2:0 YUV (U and V planes swapped)
+NV12	Planar 4:2:0 YUV (U and V planes combined)
+NV21	Planar 4:2:0 YUV (U and V planes combined, U and V swapped)
+
+Hardware overlays work in both 32bpp (BGRx) and 16bpp (RGB16) framebuffer modes.
+
+*** Troubleshooting ***
+
+Additional debug messages can be enabled with the generic GStreamer command
+line option --gst-debug. For fbdev2sink:
+
+	--gst-debug=framebuffersink:5,fbdevframebuffersink:5,fbdev2sink:5
+
+For drmsink:
+
+        --gst-debug=framebuffersink:5,drmsink:5
+
+*** To do ***
+
+- Test on different platforms.
+
+- An effort has been made to make a running plugin instance reconfigurable
+  and to free allocated resources in time. This has not yet been verified.
+
+- Slow video memory read access may impact performance for movie playback
+  when the buffer pool in video memory is enabled. Maybe autodetect the
+  best strategy.
+
+- Perhaps use a seperate rendering thread.
+
+- High-resolution movie playback doesn't seem to be as smooth as possible
+  when using playbin. It may be possible to more equally distribute
+  processing among different threads/CPU cores.
+
+- For certain common movie file types set_caps and propose_allocation are
+  called twice by upstream. This can be a problem in video memory buffer pool
+  mode because we usually provide all available video memory buffers in the
+  first call to propose_allocation. This is currently worked around by
+  implementing a lazy allocation scheme for video memory pool buffers: buffers
+  are only allocated when they are mapped for the first time. This seems to
+  solve the out-of-video-memory issues.
+
+- The preserve-par property currently only works when hardware scaling is
+  possible (e.g. sunxifbsink). When hardware scaling is not available, we
+  cannot change the display out size when set_caps is called; we would need
+  to inform upstream to do the appropriate scaling during caps negotiation
+  (get_caps).
